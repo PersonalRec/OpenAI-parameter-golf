@@ -17,6 +17,7 @@ import uuid
 import zlib
 from collections.abc import Callable
 from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 import sentencepiece as spm
@@ -25,6 +26,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
+
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
@@ -52,7 +54,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    train_log_every: int = int(os.environ.get("", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
@@ -69,16 +71,16 @@ class Hyperparameters:
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 16))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 496))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_base: float = float(os.environ.get("ROPE_BASE", 500.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
@@ -136,6 +138,84 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+
+# @dataclass
+# class TrainingStage:
+#     lr_mul: float
+#     batch_size: int
+#     window_sizes: tuple[int, int]  # (short, long) in block units
+#     mtp_weights_start: list[float]
+#     mtp_weights_end: list[float]
+#     train_max_seq_len: int
+#     duration: float = None
+
+# class TrainingSchedule:
+#     """
+#     Training schedule initialized via TRAINING_STAGES
+#         1. Multi Token Prediction schedule of [1, 0.5, 0.25->0] -> [1, 0.5->0] -> [1] @varunneal
+#         2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
+#         3. YaRN updates to RoPE on window changes
+#         4. Split embed and lm head at 2/3 of training
+#         5. Batch size schedule of 8 -> 16 -> 24
+#         6. Post training extension of long windows from 13 to 20
+#         7. Seq len updates from 896 to 2048 at 1/3 of training
+#     """
+
+#     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
+#                  cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
+#         self.stages = stages
+#         self.scheduled_iterations = scheduled_iterations
+#         self.cooldown_frac = cooldown_frac
+#         # increase final validation ws, used for YaRN extension and short window size @classiclarryd
+#         self.ws_post_yarn_ext = ws_post_yarn_ext
+
+#         self.total_steps = self.scheduled_iterations + extension_iterations
+
+#         # Build stage boundaries (last is extension stage)
+#         ends = [0] + [round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])] + [self.total_steps]
+#         assert self.scheduled_iterations == ends[-2]
+#         self.boundaries = list(pairwise(ends))
+
+#         # Split embed at specified stage (ensure odd step for Adam)
+#         self.split_step = self.boundaries[split_embed_stage][0] | 1
+
+#         # Precompute MTP weights for all steps
+#         self.mtp_weights = []
+#         for step in range(self.total_steps + 1):
+#             stage, t = self.lookup(step)
+#             w = [a + (b - a) * t for a, b in zip(stage.mtp_weights_start, stage.mtp_weights_end)]
+#             self.mtp_weights.append(torch.tensor(w, device=device))
+
+#     def lookup(self, step: int) -> tuple[TrainingStage, float]:
+#         # Returns stage and % of the way through that stage
+#         for i, (start, end) in enumerate(self.boundaries):
+#             if step < end:
+#                 t = (step - start) / (end - start)
+#                 return self.stages[i], t
+#         return self.stages[-1], 1.0
+
+#     def get_lr(self, step: int) -> float:
+#         # learning rate schedule: tied to batch size schedule, with cooldown at the end
+#         stage, _ = self.lookup(step)
+#         lr = stage.lr_mul
+#         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
+#         if step >= cd_start:
+#             t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
+#             lr = lr * (1 - t) + 0.15 * t
+#         return lr
+
+# # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
+# TRAINING_STAGES = [
+#     TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+#                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
+#     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+#                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
+#     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+#                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+#     # extension stage
+#     TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+#                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+# ]
 
 
 def token_chunks(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> list[int]:
@@ -834,6 +914,7 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
 
 
 def main() -> None:
+    _main_start_time = time.perf_counter()
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
     # ==============================================================================
@@ -1062,6 +1143,7 @@ def main() -> None:
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
+
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
@@ -1098,6 +1180,10 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    _total_elapsed = time.perf_counter() - _main_start_time
+    _minutes, _seconds = divmod(_total_elapsed, 60)
+    log(f"total_wall_time:{_total_elapsed:.1f}s ({int(_minutes)}m {_seconds:.1f}s)")
 
 
 if __name__ == "__main__":
